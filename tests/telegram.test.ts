@@ -44,3 +44,11 @@ test('copies media messages into the selected forum topic', async () => {
   }) as typeof fetch);
   assert.equal((await api.copyMessage(-100, 123, 7, { message_thread_id: 42 })).message_id, 8);
 });
+
+test('native fetch is invoked with its global receiver, as required by Cloudflare Workers', async () => {
+  const api = new TelegramApi('fake', async function (this: unknown) {
+    assert.equal(this, globalThis, 'fetch must not receive the TelegramApi instance');
+    return Response.json({ ok: true, result: { message_id: 12 } });
+  } as typeof fetch);
+  assert.equal((await api.sendMessage(1, 'test')).message_id, 12);
+});

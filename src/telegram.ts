@@ -34,7 +34,8 @@ export class TelegramApi {
     try {
       let response: Response;
       try {
-        response = await this.fetcher(`https://api.telegram.org/bot${this.token}/${method}`, {
+        // Workers' native fetch rejects a class instance as its receiver ("Illegal invocation").
+        response = await this.fetcher.call(globalThis, `https://api.telegram.org/bot${this.token}/${method}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
