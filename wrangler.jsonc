@@ -13,7 +13,7 @@
     {
       "binding": "DB",
       "database_name": "hse-genshin-bot",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "61c05b5d-4eec-4d65-87fa-669b63e63f7f",
       "migrations_dir": "migrations"
     }
   ],
