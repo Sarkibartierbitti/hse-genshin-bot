@@ -7,8 +7,8 @@ import { formatDateTime, parseDateTime } from './time.js';
 type Button = { text: string; callback_data?: string; url?: string };
 type Keyboard = Button[][];
 type Values = Record<string, unknown>;
-type FormData = { token: string; values: Values; lastUpdateId?: number; itemId?: string; taskId?: string; parentId?: string | null; kind?: 'event' | 'post'; field?: string; action?: string };
-type Context = { env: Env; db: Database; telegram: TelegramApi; now: number; updateId: number; user: UserRow; chatId: number };
+type FormData = { token: string; values: Values; scope?: { chatId: number; threadId: number | null }; lastUpdateId?: number; itemId?: string; taskId?: string; parentId?: string | null; kind?: 'event' | 'post'; field?: string; action?: string };
+type Context = { env: Env; db: Database; telegram: TelegramApi; now: number; updateId: number; user: UserRow; chatId: number; threadId: number | null; privateChat: boolean; internalGroup: boolean };
 
 const STATUSES: Record<ItemStatus, string> = { idea: 'Идея', development: 'В разработке', ready: 'Готов', done: 'Провели / опубликовано', cancelled: 'Отменено' };
 const PAGE_SIZE = 8;
@@ -19,27 +19,52 @@ const bootstraps = (env: Env): number[] => (env.BOOTSTRAP_ORG_IDS ?? '').split(/
 const timezone = (ctx: Context): string => ctx.env.TIMEZONE || 'Europe/Moscow';
 const time = (ctx: Context, value: number | null): string => formatDateTime(value, timezone(ctx));
 const mainButton = (): Button[] => [cb('🏠 Меню', 'menu')];
+const canOrganizeHere = (ctx: Context): boolean => ctx.privateChat || ctx.internalGroup;
+const topicExtra = (ctx: Context): Record<string, unknown> => ctx.threadId === null ? {} : { message_thread_id: ctx.threadId };
 
-async function say(ctx: Context, text: string, keyboard?: Keyboard): Promise<void> {
-  await ctx.telegram.sendMessage(ctx.chatId, text, keyboard ? { reply_markup: { inline_keyboard: keyboard } } : {});
+function matchesScope(ctx: Context, data: FormData): boolean {
+  // Forms created by older versions were private-only.
+  if (!data.scope) return ctx.privateChat && ctx.chatId === ctx.user.id;
+  return data.scope.chatId === ctx.chatId && data.scope.threadId === ctx.threadId;
 }
 
-async function isOrg(ctx: Context): Promise<boolean> {
-  const fresh = await getUser(ctx.db, ctx.user.id);
-  if (fresh?.role === 'org') { ctx.user = fresh; ctx.telegram.markOrganizerContent(); return true; }
+async function clearCurrentSession(ctx: Context): Promise<boolean> {
+  const session = await getSession(ctx.db, ctx.user.id, ctx.now);
+  if (!session) return false;
+  try {
+    if (!matchesScope(ctx, JSON.parse(session.data) as FormData)) return false;
+  } catch { if (!ctx.privateChat) return false; }
   await clearSession(ctx.db, ctx.user.id);
-  await say(ctx, 'Это доступно организаторам. Откройте меню, чтобы продолжить.', [mainButton()]);
+  return true;
+}
+
+async function say(ctx: Context, text: string, keyboard?: Keyboard): Promise<void> {
+  await ctx.telegram.sendMessage(ctx.chatId, text, { ...topicExtra(ctx), ...(keyboard ? { reply_markup: { inline_keyboard: keyboard } } : {}) });
+}
+
+async function isOrg(ctx: Context, configuringChat = false): Promise<boolean> {
+  const fresh = await getUser(ctx.db, ctx.user.id);
+  if (fresh?.role === 'org' && (configuringChat || canOrganizeHere(ctx))) { ctx.user = fresh; ctx.telegram.markOrganizerContent(); return true; }
+  await clearCurrentSession(ctx);
+  await say(ctx, fresh?.role === 'org' ? 'Организационные действия доступны в личке и в настроенной беседе оргов. В этой группе показываю только публичную информацию.' : 'Это доступно организаторам. Откройте меню, чтобы продолжить.', [mainButton()]);
   return false;
 }
 
 async function menu(ctx: Context): Promise<void> {
   const user = await getUser(ctx.db, ctx.user.id);
-  if (user?.role === 'org') ctx.telegram.markOrganizerContent();
+  const org = user?.role === 'org' && canOrganizeHere(ctx);
+  if (org) ctx.telegram.markOrganizerContent();
+  if (!ctx.privateChat) {
+    const keyboard: Keyboard = [[cb(LABELS.public, `cal:p:${monthKey(ctx)}:0`), cb(LABELS.subscribe, 'subscription')], [cb(LABELS.suggest, 'suggest')]];
+    if (org) keyboard.push([cb(LABELS.internal, `cal:o:${monthKey(ctx)}:0`), cb(LABELS.mine, 'mine:0')], [cb(LABELS.event, 'new:event'), cb(LABELS.post, 'new:post')], [cb(LABELS.roles, 'roles')]);
+    await say(ctx, 'Высшая школа геншина\nВыберите действие. Ответы и формы остаются в этой теме. Даты и время — по Москве.', keyboard);
+    return;
+  }
   const keyboard: string[][] = [[LABELS.public, LABELS.subscribe], [LABELS.suggest]];
-  if (user?.role === 'org') keyboard.push([LABELS.internal, LABELS.mine], [LABELS.event, LABELS.post], [LABELS.roles]);
+  if (org) keyboard.push([LABELS.internal, LABELS.mine], [LABELS.event, LABELS.post], [LABELS.roles]);
   await ctx.telegram.sendMessage(ctx.chatId,
     'Высшая школа геншина\nВыберите действие. Даты и время — по Москве.\n\n/start — меню · /cancel — отменить форму · /id — ваш Telegram ID',
-    { reply_markup: { keyboard: keyboard.map(row => row.map(text => ({ text }))), resize_keyboard: true } });
+    { ...topicExtra(ctx), reply_markup: { keyboard: keyboard.map(row => row.map(text => ({ text }))), resize_keyboard: true } });
 }
 
 function monthKey(ctx: Context): string {
@@ -98,7 +123,7 @@ async function itemForOrg(ctx: Context, id: string): Promise<ItemRow | null> {
 async function showItem(ctx: Context, id: string): Promise<void> {
   const item = await ctx.db.get<ItemRow>('SELECT * FROM items WHERE id=?', [id]);
   const fresh = await getUser(ctx.db, ctx.user.id);
-  const org = fresh?.role === 'org';
+  const org = fresh?.role === 'org' && canOrganizeHere(ctx);
   if (org) ctx.telegram.markOrganizerContent();
   if (!item || (!org && !(item.kind === 'event' && item.published && item.visibility === 'public'))) {
     await say(ctx, 'Карточка недоступна.', [mainButton()]); return;
@@ -135,7 +160,9 @@ async function editItemMenu(ctx: Context, id: string): Promise<void> {
 async function subscription(ctx: Context, value?: boolean): Promise<void> {
   if (value !== undefined) await ctx.db.run('UPDATE users SET subscribed=?,updated_at=? WHERE id=?', [value ? 1 : 0, ctx.now, ctx.user.id]);
   const user = await getUser(ctx.db, ctx.user.id);
-  await say(ctx, user?.subscribed ? '🔔 Вы подписаны на напоминания об окончании регистрации на все публичные мероприятия: за 72 и 24 часа.' : 'Напоминания в личку выключены. Можно подписаться на все публичные мероприятия.', [[cb(user?.subscribed ? 'Выключить напоминания' : 'Включить напоминания', user?.subscribed ? 'sub:off' : 'sub:on')], mainButton()]);
+  let text = user?.subscribed ? '🔔 Вы подписаны на напоминания об окончании регистрации на все публичные мероприятия: за 72 и 24 часа.' : 'Напоминания в личку выключены. Можно подписаться на все публичные мероприятия.';
+  if (user?.subscribed && !user.dm_active) text += '\nДля личных напоминаний сначала откройте личный чат с ботом и отправьте /start.';
+  await say(ctx, text, [[cb(user?.subscribed ? 'Выключить напоминания' : 'Включить напоминания', user?.subscribed ? 'sub:off' : 'sub:on')], mainButton()]);
 }
 
 async function showTasks(ctx: Context, itemId: string, offset = 0): Promise<void> {
@@ -198,6 +225,7 @@ async function saveForm(ctx: Context, flow: string, step: string, data: FormData
   data.token = crypto.randomUUID().slice(0, 8);
   // A retried Telegram update must not be consumed again by the following form step.
   data.lastUpdateId = ctx.updateId;
+  data.scope = { chatId: ctx.chatId, threadId: ctx.threadId };
   await putSession(ctx.db, ctx.user.id, flow, step, data, ctx.now);
   await prompt(ctx, flow, step, data);
 }
@@ -228,6 +256,7 @@ async function prompt(ctx: Context, flow: string, step: string, data: FormData):
   if (step === 'registration_deadline') text = 'Когда заканчивается регистрация? ДД.ММ.ГГГГ ЧЧ:ММ, по Москве.\nУчастникам и публичным группам придут напоминания за 72 и 24 часа. Алерт работает только у опубликованного публичного мероприятия.';
   if (step === 'user') text = `${data.action === 'remove' ? 'У кого снять роль организатора' : 'Кого сделать организатором'}? Отправьте @ник или Telegram ID. Человек сначала должен запустить бота.`;
   if (step === 'content') text = 'Отправьте предложение одним сообщением: текст, фото, видео, документ, голосовое или стикер. Оно попадёт в тему предложений у оргов, вместе с вашим именем.\nДля альбома отправьте одно фото с описанием или отдельные сообщения через новые предложения.';
+  if (!ctx.privateChat && !['status', 'visibility'].includes(step)) text += '\n\nОтветьте на это сообщение в этой же теме. Отмена — /cancel.';
   keyboard.push([formButton(data, 'Отмена', 'cancel')]);
   await say(ctx, text, keyboard);
 }
@@ -490,6 +519,10 @@ async function formInput(ctx: Context, message: TelegramMessage | null, action?:
   let data: FormData;
   try { data = JSON.parse(session.data) as FormData; } catch { await clearSession(ctx.db, ctx.user.id); await say(ctx, 'Форма повреждена. Начните заново из меню.'); return true; }
   if (!data.token || !data.values) { await clearSession(ctx.db, ctx.user.id); return true; }
+  if (!matchesScope(ctx, data)) {
+    if (token) await say(ctx, 'Эта форма открыта в другом чате или теме. Продолжите её там либо начните новую форму здесь.');
+    return Boolean(token);
+  }
   if (data.lastUpdateId === ctx.updateId) {
     if (session.flow !== 'suggestion' && !await isOrg(ctx)) return true;
     await prompt(ctx, session.flow, session.step, data);
@@ -501,7 +534,7 @@ async function formInput(ctx: Context, message: TelegramMessage | null, action?:
 }
 
 async function configureChat(ctx: Context, message: TelegramMessage, type: 'org' | 'suggestions'): Promise<void> {
-  if (!await isOrg(ctx)) return;
+  if (!await isOrg(ctx, true)) return;
   if (message.chat.type !== 'group' && message.chat.type !== 'supergroup') { await say(ctx, 'Выполните эту команду в нужной теме беседы оргов, куда добавлен бот.'); return; }
   const prefix = type === 'org' ? 'org' : 'suggestions';
   // The settings and internal-group flag change atomically: never briefly broadcast into the org chat.
@@ -515,7 +548,11 @@ async function configureChat(ctx: Context, message: TelegramMessage, type: 'org'
 
 async function handleCallback(ctx: Context, data: string): Promise<void> {
   const [command, a, b, c] = data.split(':');
-  if (command === 'menu') { await clearSession(ctx.db, ctx.user.id); await menu(ctx); }
+  if (command === 'menu') { await clearCurrentSession(ctx); await menu(ctx); }
+  else if (command === 'new' && (a === 'event' || a === 'post')) await beginItem(ctx, a);
+  else if (command === 'roles') await roles(ctx);
+  else if (command === 'subscription') await subscription(ctx);
+  else if (command === 'suggest') await beginSuggestion(ctx);
   else if (command === 'cal') await calendar(ctx, a === 'o', b, Number(c));
   else if (command === 'ideas') await ideas(ctx, Number(a));
   else if (command === 'item') await showItem(ctx, a);
@@ -564,38 +601,56 @@ export async function handleUpdate(update: TelegramUpdate, env: Env, db: Databas
   const message = update.message ?? callback?.message;
   const from = callback?.from ?? message?.from;
   if (!message || !from || from.is_bot || message.chat.type === 'channel') return;
+  const input = message.text?.trim() ?? '';
+  const firstToken = input.split(/\s/, 1)[0] ?? '';
+  const [commandName, addressedBot] = firstToken.split('@');
+  if (commandName.startsWith('/') && addressedBot && env.BOT_USERNAME && addressedBot.toLowerCase() !== env.BOT_USERNAME.replace(/^@/, '').toLowerCase()) return;
+  const command = commandName.toLowerCase();
+  const privateChat = message.chat.type === 'private';
+  let internalGroup = false;
+  if (!privateChat && String(message.chat.id) === await getSetting(db, 'org_chat_id')) {
+    internalGroup = (await db.get<{ org_only: number }>('SELECT org_only FROM groups WHERE chat_id=?', [message.chat.id]))?.org_only === 1;
+  }
   const user = await upsertUser(db, from, bootstraps(env), now);
-  if (user.role === 'org') telegram.markOrganizerContent();
-  const ctx: Context = { env, db, telegram, now, updateId: update.update_id, user, chatId: message.chat.id };
-  if (message.chat.type === 'private') await db.run('UPDATE users SET dm_active=1,updated_at=? WHERE id=?', [now, user.id]);
+  const ctx: Context = { env, db, telegram, now, updateId: update.update_id, user, chatId: message.chat.id, threadId: message.message_thread_id ?? null, privateChat, internalGroup };
+  if (user.role === 'org' && canOrganizeHere(ctx)) telegram.markOrganizerContent();
+  if (privateChat) await db.run('UPDATE users SET dm_active=1,updated_at=? WHERE id=?', [now, user.id]);
   if (callback) {
     await telegram.answerCallbackQuery(callback.id);
-    if (message.chat.type !== 'private') { await say(ctx, 'Управление и личное расписание доступны в личном чате с ботом.'); return; }
     if (callback.data) await handleCallback(ctx, callback.data);
     return;
   }
-  const input = message.text?.trim() ?? '';
-  const command = input.split(/\s/, 1)[0]?.split('@')[0]?.toLowerCase();
-  if (command === '/id') { await telegram.sendMessage(ctx.chatId, `Ваш Telegram ID: ${from.id}${message.chat.type !== 'private' ? `\nID чата: ${message.chat.id}${message.message_thread_id ? `\nID темы: ${message.message_thread_id}` : ''}` : ''}`, message.message_thread_id ? { message_thread_id: message.message_thread_id } : {}); return; }
+  if (command === '/id') { await say(ctx, `Ваш Telegram ID: ${from.id}${!privateChat ? `\nID чата: ${message.chat.id}${ctx.threadId !== null ? `\nID темы: ${ctx.threadId}` : ''}` : ''}`); return; }
   if (command === '/orgchat' || command === '/suggestionschat') { await configureChat(ctx, message, command === '/orgchat' ? 'org' : 'suggestions'); return; }
-  if (message.chat.type !== 'private') return;
   if (['/start', '/menu', '/help', '/cancel'].includes(command)) {
-    await clearSession(db, from.id);
-    if (command === '/cancel') await say(ctx, 'Форма отменена.');
+    const cleared = await clearCurrentSession(ctx);
+    if (command === '/cancel') await say(ctx, cleared ? 'Форма отменена.' : 'В этом чате и теме нет активной формы.');
     await menu(ctx); return;
   }
   if (command === '/calendar' || command === '/subscribe' || command === '/unsubscribe' || command === '/suggest') {
-    await clearSession(db, from.id);
+    await clearCurrentSession(ctx);
     if (command === '/calendar') await calendar(ctx, false);
     else if (command === '/suggest') await beginSuggestion(ctx);
     else await subscription(ctx, command === '/subscribe');
+    return;
+  }
+  if (['/event', '/post', '/tasks', '/internal', '/organizers'].includes(command)) {
+    if (!await isOrg(ctx)) return;
+    await clearCurrentSession(ctx);
+    if (command === '/event' || command === '/post') await beginItem(ctx, command === '/event' ? 'event' : 'post');
+    else if (command === '/tasks') await myTasks(ctx);
+    else if (command === '/internal') await calendar(ctx, true);
+    else await roles(ctx);
     return;
   }
   const actions: Record<string, () => Promise<void>> = {
     [LABELS.public]: () => calendar(ctx, false), [LABELS.subscribe]: () => subscription(ctx), [LABELS.suggest]: () => beginSuggestion(ctx),
     [LABELS.internal]: () => calendar(ctx, true), [LABELS.mine]: () => myTasks(ctx), [LABELS.event]: () => beginItem(ctx, 'event'), [LABELS.post]: () => beginItem(ctx, 'post'), [LABELS.roles]: () => roles(ctx), [LABELS.menu]: () => menu(ctx)
   };
-  if (Object.hasOwn(actions, input)) { await clearSession(db, from.id); await actions[input](); return; }
+  if (privateChat && Object.hasOwn(actions, input)) { await clearCurrentSession(ctx); await actions[input](); return; }
+  // Unrecognized commands in groups may be addressed to another bot; never forward them as suggestions.
+  if (!privateChat && firstToken.startsWith('/')) return;
   if (await formInput(ctx, message)) return;
+  if (!privateChat) return;
   await say(ctx, 'Выберите действие в меню. Для предложения нажмите «💡 Предложить идею».'); await menu(ctx);
 }

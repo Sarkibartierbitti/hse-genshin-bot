@@ -31,7 +31,6 @@ export async function commitReplies(
   db: Database, updateId: number, leaseUntil: number, actorId: number | null,
   messages: NotificationPayload[], now: number,
 ): Promise<string[]> {
-  const actor = actorId === null ? null : await db.get<{ role: string }>('SELECT role FROM users WHERE id=?', [actorId]);
   const ids: string[] = [];
   const statements: { sql: string; params: DBValue[] }[] = [];
   for (const [index, message] of messages.entries()) {
@@ -39,8 +38,8 @@ export async function commitReplies(
     ids.push(id);
     const chatId = Number(message.body.chat_id);
     const threadId = typeof message.body.message_thread_id === 'number' ? message.body.message_thread_id : null;
-    const payload: NotificationPayload = { ...message, ...(actorId ? { actor_user_id: actorId } : {}),
-      ...(actor?.role === 'org' ? { required_role: 'org' as const } : {}) };
+    // Sensitivity is captured while rendering; never infer it from a later role snapshot.
+    const payload: NotificationPayload = { ...message, ...(actorId ? { actor_user_id: actorId } : {}) };
     // Every insertion and completion shares the same lease fence in one atomic D1 batch.
     statements.push({ sql: `INSERT OR IGNORE INTO notifications
       (id,dedupe_key,kind,recipient_user_id,chat_id,thread_id,scheduled_at,expires_at,payload,state,next_attempt_at,created_at)

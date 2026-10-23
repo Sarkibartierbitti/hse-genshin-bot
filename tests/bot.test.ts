@@ -26,14 +26,14 @@ function harness(seed = '1') {
     await handleUpdate(update, env, storage.db, telegram, NOW);
     return update.message!;
   }
-  async function press(from: TelegramUser, data: string) {
-    await handleUpdate({ update_id: sequence++, callback_query: { id: String(sequence), from, data, message: { message_id: sequence, chat: { id: from.id, type: 'private' } } } }, env, storage.db, telegram, NOW);
+  async function press(from: TelegramUser, data: string, extra: Partial<TelegramMessage> = {}) {
+    await handleUpdate({ update_id: sequence++, callback_query: { id: String(sequence), from, data, message: { message_id: sequence, chat: { id: from.id, type: 'private' }, ...extra } } }, env, storage.db, telegram, NOW);
   }
-  async function choice(from: TelegramUser, value: string) {
+  async function choice(from: TelegramUser, value: string, extra: Partial<TelegramMessage> = {}) {
     const session = await getSession(storage.db, from.id, NOW);
     assert.ok(session, 'form session exists');
     const data = JSON.parse(session.data) as { token: string };
-    await press(from, `f:${data.token}:${value}`);
+    await press(from, `f:${data.token}:${value}`, extra);
   }
   async function knownUsers() { for (const user of [ALICE, BOB, MEMBER]) await send(user, '/start'); await storage.db.run("UPDATE users SET role='org' WHERE id=?", [BOB.id]); }
   async function event(title = 'Вечер Геншина') {
@@ -314,5 +314,109 @@ test('twenty assignees use bounded lookups and bulk writes within D1 Free query 
     const item = await h.db.get<ItemRow>("SELECT * FROM items WHERE title='Большая команда'");
     assert.ok(item);
     assert.equal((await h.db.all('SELECT * FROM item_assignees WHERE item_id=?', [item.id])).length, 20);
+  } finally { h.close(); }
+});
+
+test('organizers create in any configured org-chat topic and all replies stay in that topic', async () => {
+  const h = harness();
+  try {
+    await h.knownUsers();
+    h.env.BOT_USERNAME = 'hsg_org_bot';
+    const chat = { id: -1001313049342, type: 'supergroup' as const, title: 'Орги ВШГ' };
+    const a = { chat, message_thread_id: 32 };
+    const b = { chat, message_thread_id: 47 };
+    await h.send(ALICE, '/orgchat', { chat });
+    const firstReply = h.sent.length;
+    await h.send(ALICE, '/start@hsg_org_bot', a);
+    assert.ok(h.sent.at(-1)?.extra.reply_markup.inline_keyboard.flat().some((button: any) => button.callback_data === 'new:event'));
+    await h.press(ALICE, 'new:event', a);
+    const initial = await getSession(h.db, ALICE.id, NOW);
+    assert.deepEqual(JSON.parse(initial!.data).scope, { chatId: chat.id, threadId: 32 });
+    await h.send(ALICE, 'Это разговор в другой теме', b);
+    assert.deepEqual(await getSession(h.db, ALICE.id, NOW), initial);
+    await h.send(ALICE, '/start@hsg_org_bot', b);
+    assert.deepEqual(await getSession(h.db, ALICE.id, NOW), initial, 'a menu in another topic preserves the active form');
+    await h.send(ALICE, 'Тематическая встреча', a);
+    await h.choice(ALICE, 'ready', b);
+    assert.equal((await getSession(h.db, ALICE.id, NOW))?.step, 'status', 'cross-topic form callback cannot advance');
+    await h.choice(ALICE, 'ready', a);
+    await h.send(ALICE, '15.11.2026 19:00', a);
+    await h.choice(ALICE, 'private', a);
+    await h.choice(ALICE, 'self', a);
+    const finishing = h.sent.length;
+    await h.send(ALICE, 'Покровка', a);
+    const item = await h.db.get<ItemRow>("SELECT * FROM items WHERE title='Тематическая встреча'");
+    assert.ok(item);
+    assert.equal(item.visibility, 'private');
+    assert.ok(h.sent.slice(finishing).every(m => m.chatId === chat.id && m.extra.message_thread_id === 32));
+    assert.ok(h.sent.slice(firstReply).every(m => m.chatId === chat.id && [32, 47].includes(m.extra.message_thread_id)));
+    const otherTopic = h.sent.length;
+    await h.send(ALICE, '/tasks@hsg_org_bot', b);
+    assert.ok(h.sent.slice(otherTopic).every(m => m.extra.message_thread_id === 47));
+  } finally { h.close(); }
+});
+
+test('private forms and internal cards stay isolated from public group commands, chatter and callbacks', async () => {
+  const h = harness();
+  try {
+    await h.knownUsers();
+    h.env.BOT_USERNAME = 'hsg_org_bot';
+    const internal = { chat: { id: -1001313049342, type: 'supergroup' as const }, message_thread_id: 31 };
+    const external = { chat: { id: -100777, type: 'supergroup' as const }, message_thread_id: 99 };
+    await h.send(ALICE, '/orgchat', internal);
+    await h.db.run('INSERT INTO groups(chat_id,title,enabled,org_only,updated_at) VALUES(?,?,1,1,?)', [external.chat.id, 'Старая беседа оргов', NOW]);
+    const secret = await h.event('Внутренний секрет');
+    await h.send(ALICE, '➕ Мероприятие');
+    const privateForm = await getSession(h.db, ALICE.id, NOW);
+    await h.send(ALICE, 'Не название мероприятия', internal);
+    await h.send(ALICE, '/cancel@hsg_org_bot', external);
+    await h.send(ALICE, '/start@hsg_org_bot', external);
+    assert.deepEqual(await getSession(h.db, ALICE.id, NOW), privateForm);
+    const groupMenu = h.sent.at(-1)!;
+    const labels = groupMenu.extra.reply_markup.inline_keyboard.flat().map((button: any) => button.callback_data);
+    assert.ok(!labels.includes('new:event') && !labels.includes('roles'));
+    const start = h.sent.length;
+    await h.press(ALICE, `item:${secret.id}`, external);
+    await h.press(MEMBER, `item:${secret.id}`, external);
+    await h.press(ALICE, 'new:event', external);
+    await h.press(MEMBER, 'cal:o:2026-11:0', external);
+    assert.ok(h.sent.slice(start).every(m => !m.text.includes('Внутренний секрет')));
+    assert.deepEqual(await getSession(h.db, ALICE.id, NOW), privateForm);
+    const silence = h.sent.length;
+    await h.send(MEMBER, 'Обычный разговор', external);
+    await h.send(MEMBER, '➕ Мероприятие', external);
+    await h.send(MEMBER, '/start@different_bot', external);
+    assert.equal(h.sent.length, silence);
+    assert.equal((await h.db.all('SELECT * FROM suggestions')).length, 0);
+  } finally { h.close(); }
+});
+
+test('group suggestions require an explicit flow in the same topic and route only to suggestions topic 11', async () => {
+  const h = harness();
+  try {
+    await h.knownUsers();
+    h.env.BOT_USERNAME = 'hsg_org_bot';
+    const chat = { id: -1001313049342, type: 'supergroup' as const, title: 'Орги ВШГ' };
+    const publicA = { chat: { id: -100777, type: 'supergroup' as const }, message_thread_id: 99 };
+    const publicB = { ...publicA, message_thread_id: 100 };
+    await h.send(ALICE, '/orgchat', { chat });
+    await h.send(ALICE, '/suggestionschat', { chat, message_thread_id: 11 });
+    await h.send(MEMBER, 'Может, сыграем?', publicA);
+    assert.equal((await h.db.all('SELECT * FROM suggestions')).length, 0);
+    await h.send(MEMBER, '/suggest@hsg_org_bot', publicA);
+    await h.send(MEMBER, 'Это другая тема', publicB);
+    await h.send(BOB, 'Это другой человек', publicA);
+    assert.equal((await h.db.all('SELECT * FROM suggestions')).length, 0);
+    const original = await h.send(MEMBER, 'Предлагаю квиз', publicA);
+    const job = await h.db.get<NotificationRow>("SELECT * FROM notifications WHERE kind='suggestion'");
+    assert.ok(job);
+    const payload = JSON.parse(job.payload);
+    assert.equal(payload.body.chat_id, chat.id);
+    assert.equal(payload.body.message_thread_id, 11);
+    assert.equal(payload.body.from_chat_id, publicA.chat.id);
+    assert.equal(payload.body.message_id, original.message_id);
+    assert.equal(h.sent.at(-1)!.extra.message_thread_id, 99);
+    await h.send(MEMBER, 'Продолжаем обычную беседу', publicA);
+    assert.equal((await h.db.all('SELECT * FROM suggestions')).length, 1);
   } finally { h.close(); }
 });

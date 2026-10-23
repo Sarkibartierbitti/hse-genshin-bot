@@ -179,7 +179,9 @@ async function valid(db: Database, job: NotificationRow, now: number): Promise<b
         AND EXISTS (SELECT 1 FROM users actor WHERE actor.id=CAST(json_extract(n.payload,'$.actor_user_id') AS INTEGER)
           AND (json_extract(n.payload,'$.required_role') IS NULL OR (json_extract(n.payload,'$.required_role')='org' AND actor.role='org')))
         AND ((n.chat_id>0 AND EXISTS (SELECT 1 FROM users recipient WHERE recipient.id=n.chat_id AND recipient.dm_active=1))
-          OR (n.chat_id<0 AND g.enabled=1)))
+          OR (n.chat_id<0 AND g.enabled=1
+            AND (json_extract(n.payload,'$.required_role') IS NULL
+              OR (g.org_only=1 AND (n.chat_id=c.org_chat OR n.chat_id=c.suggestions_chat))))))
       OR
       (n.kind='suggestion' AND n.chat_id<0 AND n.chat_id=c.suggestions_chat
         AND n.thread_id IS c.suggestions_thread AND (g.chat_id IS NULL OR g.enabled=1))

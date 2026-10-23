@@ -117,3 +117,45 @@ test('organizer sensitivity captured while rendering survives revocation before 
     assert.equal((await db.get<NotificationRow>('SELECT * FROM notifications WHERE id=?', [ids[0]]))?.state, 'cancelled');
   } finally { close(); }
 });
+
+test('an organizer can receive a public menu in a public group without exposing internal controls', async () => {
+  const { db, binding, close } = createTestDatabase();
+  const env = environment(binding);
+  const previousFetch = globalThis.fetch;
+  let sent: Record<string, unknown> | null = null;
+  globalThis.fetch = (async (_url, init) => { sent = JSON.parse(String(init?.body)); return Response.json({ ok: true, result: { message_id: 1 } }); }) as typeof fetch;
+  try {
+    await db.run("INSERT INTO groups(chat_id,title,enabled,org_only,updated_at) VALUES(-100,'Публичная',1,0,?)", [Date.now()]);
+    const value = update(60, '/start');
+    value.message!.chat = { id: -100, type: 'supergroup' };
+    value.message!.message_thread_id = 7;
+    assert.equal((await worker.fetch(request(value), env)).status, 200);
+    assert.ok(sent);
+    assert.equal((sent as Record<string, unknown>).message_thread_id, 7);
+    assert.equal(JSON.stringify(sent).includes('Для оргов'), false);
+    assert.equal((await db.get<NotificationRow>("SELECT * FROM notifications WHERE dedupe_key='reply:60:0'"))?.state, 'sent');
+  } finally { globalThis.fetch = previousFetch; close(); }
+});
+
+test('queued internal group replies are cancelled if the organizer chat changes', async () => {
+  const { db, binding, close } = createTestDatabase();
+  try {
+    const now = Date.now();
+    await db.run("INSERT INTO users(id,display_name,role,created_at,updated_at) VALUES(101,'Орг','org',?,?)", [now, now]);
+    await db.run("INSERT INTO groups(chat_id,title,enabled,org_only,updated_at) VALUES(-100,'Бывшая беседа',1,1,?)", [now]);
+    await db.run("INSERT INTO settings(key,value) VALUES('org_chat_id','-100')");
+    await claimTelegramUpdate(db, 61, now);
+    const lease = await db.get<{ lease_until: number }>('SELECT lease_until FROM telegram_updates WHERE update_id=61');
+    const buffer = new BufferedTelegramApi('fake');
+    buffer.markOrganizerContent();
+    await buffer.sendMessage(-100, 'Внутренняя карточка', { message_thread_id: 5 });
+    const ids = await commitReplies(db, 61, lease!.lease_until, 101, buffer.messages, now);
+    await db.run("UPDATE settings SET value='-200' WHERE key='org_chat_id'");
+    const api = new TelegramApi('fake');
+    let calls = 0;
+    api.call = async <T>() => { calls++; return { message_id: 1 } as T; };
+    await dispatchNotifications(environment(binding), db, api, now + 100, ids);
+    assert.equal(calls, 0);
+    assert.equal((await db.get<NotificationRow>('SELECT * FROM notifications WHERE id=?', [ids[0]]))?.state, 'cancelled');
+  } finally { close(); }
+});
