@@ -11,7 +11,7 @@ Read `TECH_SPEC.md` first. Shared files must not be overwritten by other owners.
 
 ## SQL schema (exact column names)
 
-- `users`: id INTEGER PK, username TEXT NULL, display_name TEXT, role TEXT ('member'/'org'), subscribed INTEGER DEFAULT 0, dm_active INTEGER DEFAULT 1, created_at INTEGER, updated_at INTEGER.
+- `users`: id INTEGER PK, username TEXT NULL, display_name TEXT, role TEXT ('member'/'org'), subscribed INTEGER DEFAULT 0, dm_active INTEGER DEFAULT 0, created_at INTEGER, updated_at INTEGER.
 - `items`: id TEXT PK, kind TEXT ('event'/'post'), title TEXT, start_at INTEGER NULL, visibility TEXT ('public'/'private'), status TEXT ('idea'/'development'/'ready'/'done'/'cancelled'), location TEXT NULL, post_url TEXT NULL, registration_deadline INTEGER NULL, published INTEGER DEFAULT 0, created_by INTEGER, revision INTEGER DEFAULT 1, created_at INTEGER, updated_at INTEGER.
 - `item_assignees`: item_id TEXT, user_id INTEGER, composite PK.
 - `tasks`: id TEXT PK, item_id TEXT, parent_id TEXT NULL (one nesting level), title TEXT, due_at INTEGER NULL, status TEXT ('open'/'done'), created_by INTEGER, revision INTEGER DEFAULT 1, created_at INTEGER, updated_at INTEGER.

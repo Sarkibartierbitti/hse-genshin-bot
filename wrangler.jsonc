@@ -1,0 +1,25 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "hse-genshin-bot",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "vars": {
+    "TIMEZONE": "Europe/Moscow",
+    "BROADCAST_BATCH_SIZE": "15"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hse-genshin-bot",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "triggers": { "crons": ["* * * * *"] },
+  "queues": {
+    "producers": [{ "binding": "DELIVERY_QUEUE", "queue": "hse-genshin-delivery" }],
+    "consumers": [{ "queue": "hse-genshin-delivery", "max_batch_size": 10, "max_batch_timeout": 1, "max_concurrency": 1, "max_retries": 3 }]
+  }
+}

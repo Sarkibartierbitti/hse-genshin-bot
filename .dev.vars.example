@@ -1,0 +1,5 @@
+# Copy to .dev.vars. This example contains no working secrets.
+TELEGRAM_BOT_TOKEN="replace-with-botfather-token"
+WEBHOOK_SECRET="replace-with-random-hex-string"
+BOOTSTRAP_ORG_IDS=""
+BOT_USERNAME="your_new_bot"
